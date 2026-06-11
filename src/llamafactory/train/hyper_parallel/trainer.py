@@ -19,6 +19,9 @@ import os
 import types
 from contextlib import nullcontext
 from typing import Any, Optional
+from typing_extensions import override
+from hyper_parallel import DTensor, init_device_mesh
+from hyper_parallel.core.dtensor.placement_types import Replicate
 
 import torch
 from hyper_parallel.integration.llamafactory import (
@@ -134,6 +137,24 @@ class HyperParallelTrainer(CustomSeq2SeqTrainer):
         if training and getattr(self.accelerator, "is_fsdp2", False):
             return model
         return super()._wrap_model(model, training=training)
+    
+    @override
+    def compute_loss(self, model, inputs, *args, **kwargs):
+        # TODO: 支持按TP配置
+        mesh = init_device_mesh("npu", (8, 1), mesh_dim_names=("dp", "tp"))
+        for key, value in inputs.items():
+            inputs[key] = DTensor.from_local(value, mesh["tp"], (Replicate(), ))
+        if self.finetuning_args.use_asft_loss:
+            with torch.no_grad():
+                ref_outputs = self.ref_model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask", None),
+                )
+                ref_logits = ref_outputs.logits
+            outputs = model(**inputs)
+            return self.compute_loss_func(outputs, inputs["labels"], ref_logits)
+        else:
+            return super().compute_loss(model, inputs, *args, **kwargs)
 
     def _move_model_to_device(self, model: nn.Module, device: Optional[torch.device] = None):
         """Skip redundant device moves for HSDP-wrapped models."""
